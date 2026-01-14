@@ -10,14 +10,11 @@ def create_combined_hash(question: str, answer: str) -> tuple[str, str]:
     q = _canonicalize(question)
     a = _canonicalize(answer)
 
-    # Криптографическая соль
     salt = secrets.token_hex(16)
 
-    # 1️⃣ Сначала SHA-256 (фиксированная длина)
     preimage = f"{q}|{a}|{salt}".encode("utf-8")
     digest = hashlib.sha256(preimage).digest()
 
-    # 2️⃣ Потом bcrypt (медленно и безопасно)
     hashed = bcrypt.hashpw(digest, bcrypt.gensalt())
 
     return hashed.decode("utf-8"), salt

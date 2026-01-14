@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 import random
 
@@ -6,34 +7,36 @@ from app.database import SessionLocal, engine
 from app.models import Base, User, UserQuestion
 from app.hashing import create_combined_hash, verify_answer
 
-# ---------------------------------------------------------------------
-# Создаём таблицы автоматически при старте
-# ---------------------------------------------------------------------
-Base.metadata.create_all(bind=engine)
 
-# ---------------------------------------------------------------------
-# Инициализация FastAPI
-# ---------------------------------------------------------------------
+# =========================
+# Инициализация приложения
+# =========================
+
 app = FastAPI(
-    title="Система аутентификации по вопросам",
+    title="Система аутентификации по контрольным вопросам",
+    description="""
+    API для регистрации и аутентификации пользователей
+    без использования паролей.
+
+    Пользователь подтверждает личность,
+    отвечая на заранее заданный контрольный вопрос.
+    """,
     version="1.0.0",
-    description="Аутентификация без пароля с использованием секретных вопросов"
+    swagger_ui_parameters={"defaultModelsExpandDepth": -1}
 )
 
-# ---------------------------------------------------------------------
-# Общие вопросы
-# ---------------------------------------------------------------------
-COMMON_QUESTIONS = [
-    "Девичья фамилия матери?",
-    "Имя первого питомца?",
-    "Город рождения?",
-    "Любимый школьный предмет?",
-    "Название первой компании?"
-]
 
-# ---------------------------------------------------------------------
-# Dependency: DB Session
-# ---------------------------------------------------------------------
+# =========================
+# Создание таблиц БД
+# =========================
+
+Base.metadata.create_all(bind=engine)
+
+
+# =========================
+# Зависимость БД
+# =========================
+
 def get_db():
     db = SessionLocal()
     try:
@@ -41,94 +44,117 @@ def get_db():
     finally:
         db.close()
 
-# ---------------------------------------------------------------------
-# GET /questions — Получить список вопросов
-# ---------------------------------------------------------------------
-@app.get("/questions")
-def get_questions():
-    return {"вопросы": COMMON_QUESTIONS}
 
-# ---------------------------------------------------------------------
-# POST /register — Регистрация пользователя
-# ---------------------------------------------------------------------
-@app.post("/register")
-def register(payload: dict, db: Session = Depends(get_db)):
-    username = payload.get("username")
-    questions = payload.get("questions")
+# =========================
+# Pydantic-модели запросов
+# =========================
 
-    if not username or not isinstance(questions, list) or len(questions) < 3:
-        raise HTTPException(status_code=400, detail="Неверные данные регистрации")
+class RegisterRequest(BaseModel):
+    username: str = Field(..., description="Логин пользователя")
+    question: str = Field(..., description="Контрольный вопрос")
+    answer: str = Field(..., description="Секретный ответ")
 
-    if db.query(User).filter_by(username=username).first():
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., description="Логин пользователя")
+
+
+class VerifyRequest(BaseModel):
+    username: str = Field(..., description="Логин пользователя")
+    question_id: int = Field(..., description="ID контрольного вопроса")
+    answer: str = Field(..., description="Ответ на контрольный вопрос")
+
+
+# =========================
+# Регистрация пользователя
+# =========================
+
+@app.post(
+    "/register",
+    summary="Регистрация пользователя",
+    description="Создаёт нового пользователя и сохраняет контрольный вопрос с ответом"
+)
+def register(data: RegisterRequest, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.username == data.username).first()
+    if existing_user:
         raise HTTPException(status_code=400, detail="Пользователь уже существует")
 
-    user = User(username=username)
+    user = User(username=data.username)
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    for item in questions:
-        question = item.get("question")
-        answer = item.get("answer")
-        if not question or not answer:
-            continue
-        combined_hash, salt = create_combined_hash(question, answer)
-        uq = UserQuestion(
-            user_id=user.id,
-            question_text=question,
-            combined_hash=combined_hash,
-            salt=salt
-        )
-        db.add(uq)
+    combined_hash, salt = create_combined_hash(data.question, data.answer)
 
+    question = UserQuestion(
+        user_id=user.id,
+        question_text=data.question,
+        combined_hash=combined_hash,
+        salt=salt
+    )
+
+    db.add(question)
     db.commit()
-    return {"статус": "зарегистрирован"}
 
-# ---------------------------------------------------------------------
-# POST /login/request — Запрос случайного вопроса
-# ---------------------------------------------------------------------
-@app.post("/login/request")
-def login_request(payload: dict, db: Session = Depends(get_db)):
-    username = payload.get("username")
-    if not username:
-        raise HTTPException(status_code=400, detail="Необходимо указать имя пользователя")
+    return {"статус": "пользователь успешно зарегистрирован"}
 
-    user = db.query(User).filter_by(username=username).first()
-    if not user or not user.questions:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    question = random.choice(user.questions)
-    return {"id_вопроса": question.id, "текст_вопроса": question.question_text}
+# =========================
+# Запрос контрольного вопроса
+# =========================
 
-# ---------------------------------------------------------------------
-# POST /login/verify — Проверка ответа
-# ---------------------------------------------------------------------
-@app.post("/login/verify")
-def login_verify(payload: dict, db: Session = Depends(get_db)):
-    username = payload.get("username")
-    question_id = payload.get("question_id")
-    answer = payload.get("answer")
-
-    if not username or question_id is None or not answer:
-        raise HTTPException(status_code=400, detail="Неверные данные входа")
-
-    user = db.query(User).filter_by(username=username).first()
+@app.post(
+    "/login/request",
+    summary="Запрос контрольного вопроса",
+    description="Возвращает случайный контрольный вопрос пользователя"
+)
+def login_request(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == data.username).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    question = db.query(UserQuestion).filter_by(
-        id=question_id,
-        user_id=user.id
+    questions = db.query(UserQuestion).filter(UserQuestion.user_id == user.id).all()
+    if not questions:
+        raise HTTPException(status_code=404, detail="Контрольные вопросы не найдены")
+
+    question = random.choice(questions)
+
+    return {
+        "question_id": question.id,
+        "question": question.question_text
+    }
+
+
+# =========================
+# Проверка ответа
+# =========================
+
+@app.post(
+    "/login/verify",
+    summary="Проверка ответа",
+    description="Проверяет ответ на контрольный вопрос и выполняет аутентификацию"
+)
+def login_verify(data: VerifyRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == data.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    question = db.query(UserQuestion).filter(
+        UserQuestion.id == data.question_id,
+        UserQuestion.user_id == user.id
     ).first()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Неверный вопрос")
+        raise HTTPException(status_code=400, detail="Контрольный вопрос не найден")
 
     is_valid = verify_answer(
         question.question_text,
-        answer,
+        data.answer,
         question.combined_hash,
         question.salt
     )
 
     if not is_valid:
-        raise HTTPException(status_code=401, detail="Аутентификация не пройдена")
+        raise HTTPException(status_code=401, detail="Неверный ответ")
+
+    return {"статус": "успешная аутентификация"}
